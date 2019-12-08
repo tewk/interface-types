@@ -51,7 +51,7 @@ On first glance, specifying instantiation may seem like a trivial matter of
 spec engineering. However, there are 3 interesting use cases, described next,
 that suggest that a more general, expressive approach is required.
 
-### "Command" modules
+### Command modules
 
 If, e.g., a C program with a `main()` function is compiled to a wasm module,
 and the `main()` function is exported (directly, or indirectly via some
@@ -97,28 +97,27 @@ useful to the code duplication of static linking.
 
 A challenge with shared-everything linking is to control which instances
 share which memory. In particular, it should be possible to write a "main"
-module (the equivalent of a native `.exe`) that creates its own private memory,
-explicitly shares it with N other "side" modules (the equivalent of native
-`.dll`s), but encapsulates the memory from all other modules, so that the use of
-shared-everything linking is kept an implementation detail from the point of
-view of the main module's clients.
+module (the analogue of a native `.exe`) that creates its own private memory,
+explicitly shares it with N other "shared" modules (the analogue of native
+`.dll`/`.so`s), but encapsulates the memory from all other modules, so that the
+use of shared-everything linking is kept an implementation detail from the point
+of view of the main module's clients.
 
 In particular, it should be possible to use the wasm linking proposal to achieve
-the following configuration of instances:
+the following configuration of instances, where the orange rectangles represent
+shared-nothing boundaries maintained by the main module in each rectangle.
 
 <p align="center"><img src="./shared-everything.svg" width="600"></p>
 
 Here, `libc.wasm` is specially chosen by the toolchain to define and export
 memory (along with memory-management functions like `malloc`). Both `zip.wasm`
-and `img.wasm` make their own new, private intsances of `libc.wasm` and then
-each respectively instantiates `libm.wasm`, explicitly passing the private
-`libc.wasm` instance to `libm.wasm` as an import. If neither `zip.wasm` nor
-`img.wasm` export memory, then, from the perspective of `app.wasm`, they are
-just two shared-nothing modules and, in the future, `img.wasm` can change its
-version of `libc.wasm`, or its language/toolchain entirely and `zip.wasm` and
-`app.wasm` will be unaffected. In contrast, `img.wasm` and `libm.wasm` have to
-agree more intimately on the toolchain or ABI used to avoid clobbering each
-other in their shared memory and tables.
+and `img.wasm` are main modules, and make their own new, private intsances of
+`libc.wasm` and then each respectively instantiates `libm.wasm`, explicitly
+passing the private `libc.wasm` instance to `libm.wasm` as an import.
+
+As seen in this diagram, what we need is to be able to create a single instance
+graph which contains encapsulated subgraphs of tightly-coupled shared-everything
+modules that are loosely coupled with other shared-nothing modules.
 
 ### Link-time virtualization
 
@@ -322,7 +321,7 @@ For example, in this example:
   (@interface type $ImportType (instance
     ... some exports
   ))
-  (@interface instance $Import (type $ImportType))
+  (@interface instance $Import (import "some_import") (type $ImportType))
   (@interface func (export "foo") (result (ref $ImportType))
     ref.instance $Import
   )
@@ -358,7 +357,7 @@ For example, in this example:
     ... some exports
   ))
   (@interface instance $Import (import "whatever") (type $I))
-  (@interface func (export "spaw") (result (ref $I))
+  (@interface func (export "spawn") (result (ref $I))
     ref.instance $Import
     instantiate $ThisModule
   )
@@ -374,94 +373,100 @@ limited if it could only be called from adapter functions called from
 and linking instances where there were none to begin with.
 
 
-### Static functions
+### Constructor functions
 
-The final extension to support wasm linking is a new kind of *static* adapter
-function (henceforth abbreviated to "static function") that can be called
-given only a module, not an instance.
+The final extension to support wasm linking is a new kind of *constructor*
+function that is called when a module is intantiated, receiving the instantiation
+arguments, allowing a module to control and encapsulate more of how it is
+instantiated. In particular, this allows a module to recursively instantiate
+its dependencies (module imports) and call exported functions to establish
+initial invariants.
 
-Using a static function, the following module is able to both instantiate itself
-and immediately call an `init` function to finish initialization, passing an
-argument (overcoming the nullary limitation of [start functions]).
+A constructor function is similar to a normal adapter function, with a signature
+and body containing adapter instructions. The differences are:
+* a constructor function starts with the keyword `ctor` instead of `func`
+* the parameters of a constructor function are named with strings (for reasons
+  below)
+* the result type of a constructor function must be a `(ref (instance ...))`,
+  where the instance type is that of the containing module, and thus is not
+  explicitly declared
+* constructor function bodies are allowed to contain a new `instantiate-self`
+  instruction which allows the constructor to invoke the default spec-defined
+  instantiation (which the constructor is effectively hiding)
+
+For example, the following module is able to both instantiate itself
+and immediately call an `init` function to finish initialization. (Notice that
+this overcomes the classic limitation of [start functions] being nullary and
+their exports not being externally visible.)
 ```wasm
 ;; one.wasm
-(module $ThisModule
+(module
   (func (export "init") (param i32 i32) ...)
-  (@interface func (export "use") (result string) ...)
-  (@interface static func (param $p string) (result instanceref)
-    instantiate $ThisModule
+  (@interface ctor (param $p "initialValue" string)
+    instantiate-self
     dup
     (call-instance-export "init" (string-to-memory (local.get $p)))
   )
+  (@interface func (export "use") (result string) ...)
 )
 ```
-Here, `instanceref` is a special instance reference type which is defined
-to alias the containing module's instance type. This alias saves the module the
-annoyance and bloat of having to re-declare its own instance type.
 
-When a static function is defined, it's static function type *replaces* the
-ordinary module type so that the *only* way to instantiate the module is by
-calling the static function. We call this new static function type the *adapted
-module type*. For example, the adapted module type of `one.wasm` above is:
+When a module contains a constructor function, the constructor's signature
+modifies the module type, replacing the module imports (which are now internally
+supplied by `instantiate-self`) with the constructor's parameters. For example,
+in the *absence* of a constructor function, the above `one.wasm` would have the
+module type:
 ```wasm
-(static func
-  (param string)
-  (result (ref (instance (func (export "use") (result string)))))
+(module
+  (@interface func (export "use") (result string))
 )
 ```
-
-### Calling static functions
-
-A module with a static function can be instantiated using the same `instantiate`
-instruction as before; `instantiate` just checks that the operands match the
-static function's parameter types (instead of the imports) and then pushes the
-static function's result types (instead of the module's instance type).
-
-To see an example, let's look at a client of `one.wasm` (from the previous
-section) that uses its own static function to instantiate its `one.wasm`
-dependency.
+However, *with* the constructor function, the module type becomes:
+```wasm
+(module
+  (@interface string (import "initialValue"))
+  (@interface func (export "use") (result string))
+)
+```
+Here, `string` takes the place of `instance` and `module` as the entity that is
+being imported. Thus, when a client creates this module with the `instantiate`
+instruction, the operand type will need to be `string` instead of the usual
+`(ref (instance ...))` type. For example:
 ```wasm
 ;; two.wasm
-(module $ThisModule
-  (@interface type $OneInstanceType (instance
+(module
+  (@interface module $One (import "./one.wasm")
+    (string (import "initialValue"))
     (func (export "use") (result string))
   )
-  (@interface static func $Dependency (import "./one.wasm")
-    (param string)
-    (result (ref $OneInstanceType))
-  )
   (@interface instance (import "")
-    (type $OneInstanceType)
+    (func (export "use") (result string))
   )
-  (@interface static func (param $p string) (result instanceref)
-    (instantiate $Dependency (local.get $p))
-    instantiate $ThisModule
+  (@interface ctor (param $p string)
+    (instantiate $One (local.get $p))
+    instantiate-self
   )
 )
 ```
-Looking at the 4 definitions of this module in sequence:
-* The first defines the instance type of `one.wasm`, so that it can be used
-  twice below.
-* The second defines a module import of `./one.wasm`, which is up to the host
-  to resolve, but we'll assume does actually resolve to the above `one.wasm`
-  module.
-* The third defines an instance import with a `one.wasm`-compatible type.
-  Because there is a static function supplying the import, the import's
-  module-name string is insignificant, so empty.
-* The fourth defines `two.wasm`'s static function. This function first
-  instantiates the `./one.wasm` module import and uses the resulting instance
-  to instantiate `two.wasm`.
+Looking at the 3 definitions in this module:
+* The first definition imports the above `one.wasm` module.
+* The second definition imports an instance with a `one.wasm`-compatible
+  instance type. Because `instantiate-self` passes imports positionally,
+  the import string is insignificant and so the empty string is used.
+* The third definition defines a constructor function which first instantiates
+  the dependency (`one.wasm`) and then uses the resulting instance to instantiate
+  `two.wasm`.
 
-From another perspective, static adapter functions are vaguely similar to
-C++ static functions, with the above two wasm modules performing the
-metaphorical equivalent of:
+From another perspective, constructor functions are vaguely similar to a common
+C++ pattern of using static member functions to encapsulate construction. For
+example, the rough equivalent of the above two wasm modules is:
 
 ```c++
 class One {
-  One();
+  One() {}
   void init(string);
 public:
-  static One* New(string s) {
+  static One* ctor(string s) {
     One* one = new One();
     one->init(s);
     return one;
@@ -469,87 +474,134 @@ public:
 };
 
 class Two {
-  Two(One*);
+  One* one_;
+  Two(One* one) : one_(one) {}
 public:
-  static Two* New(string s) {
-    One* one = One::New(s);
+  static Two* ctor(string s) {
+    One* one = One::ctor(s);
     return new Two(one);
   }
 };
 ```
 
-Just as C++ static functions can be used to further encapsulate the
-process of fully constructing an object and its dependencies, so
-too can static adapter functions.
 
+### The New Picture
 
-### Static function optional parameter names
-
-While `instantiate` passes operands based on the declared import/parameter
-order, ignoring the module-name strings of imports, module-name strings can
-still be useful in some contexts.
-
-For example, the module-name of an import can be a WASI-defined string
-identifying a particular requested set of capabilities:
-```wasm
-(@interface instance (import "wasi:file")
-  (func (export "read") ...)
-  (func (export "write") ...)
-)
-```
-When a module is `instantiate`d by another module, the string `wasi:file` may
-be ignored, but when a module is instantiated directly from a host, this
-string is the only way to communicate to the host the semantic capabilities
-being requested; the instance type alone is insufficient.
-
-Since we must not lose this ability when using static functions, the parameters
-of static functions therefore allow optional names. For example:
-```wasm
-(module
-  (@interface type $wasiFile (instance
-    (func (export "read") ...)
-    (func (export "write") ...)
-  ))
-  (@interface static func (param "wasi:file" (ref $wasiFile))
-    ...
-  )
-)
-```
-
-In total, the net effect of wasm linking is that imports are ultimately split
-imports into two kinds: module imports and static function parameters. Module
-imports form a direct reference to a particular module (after host module-name
-resolution) while static function parameters are an indirect request for *some*
-instance that matches a given type that is created by "someone else" (either a
-parent module or the host directly).
+TODO: show a sweet diagram that subsumes [the original](https://github.com/WebAssembly/interface-types/blob/master/proposals/interface-types/overview.svg).
 
 
 ## Use Cases Revisited
 
+With these 4 additions to interface adapters ([module imports](#module-imports),
+[instance reference types](#instance-reference-types),
+the [`instantiate`](#instantiating-modules) instruction and
+[constructor functions](#constructor-functions)), we can now revisit the 3 use cases
+listed in the [Motivation](#motivation) and sketch how they are addressed.
+
+**Command modules**
+
+TODO: need to introduce nested modules above to solve this.
+
+**"Shared-everything" (dynamic) linking**
+
+Any dynamic linking scheme ultimately requires establishing an [ABI] that all
+participating modules (and their producing toolchain) have to adhere to.
+With dynamic linking, this ABI needs to cover not just the ABI between
+functions, but also between entire modules.
+
+To start with, a dynamic linking ABI could define an instance type which
+exported the memory, table, and the common operations to allocate and free
+memory and elements. Let's call this instance type `$libc`:
+
+```wasm
+(type $libc (instance
+  (memory (export "memory") 1)
+  (memory (export "funcptr_table") funcref 1)
+  (func (export "malloc") (param i32) (result i32))
+  (func (export "free") (param i32))
+  ...
+))
+```
+
+A given toolchain would also ship with some `libc.wasm` in its sysroot whose
+instances match `$libc`.
+
+Next, assume the toolchain makes the distinction between "main" and "shared"
+modules, where the distinction is that each main module instance creates its
+own new memory while shared modules always expect to import memory. E.g., in
+traditional C/C++ toolchain, a default compilation would produce a main module,
+while compiling with `-shared` would produce a shared module.
+
+When compiling a shared module, the toolchain would emit a constructor that takes
+a `(ref $libc)` parameter. The exports of a shared module would be those explicitly
+exported via [`dllexport`]/[`visibility("default")`], and potentially some
+ABI-defined special exports, like a `shared_main`:
+
+```wasm
+(module
+  (@interface ctor (param "libc" (ref $libc)) ...)
+  (func (export "shared_main") ...)
+  (func (export "my_export") ...)
+)
+```
+
+When compiling the main module, the toolchain would emit module imports for
+`libc.wasm` and each shared module. The main module would also have a
+constructor which would take the following steps:
+1. `instantiate` `libc.wasm`
+2. `instantiate` each shared module, passing them the `libc` instance from step 1.
+3. `instantiate-self` the main module, passing `libc` and shared instances created
+   by steps 1 and 2.
+4. Call the `shared_main` export of shared modules, if defined by the ABI.
+5. Call the main module's `main()` function.
+
+Note that this process can be recursive with shared modules themselves importing
+and instantiating shared modules. Since memory is shared explicitly through
+the `libc` parameter, modules can control which other modules they share memory
+with.
+
+The above instantiation scheme ensures that exports of shared modules can be
+imports of the main module. If shared modules need to import functions from
+the main module, they'll need to call through a `funcref` table, which is
+initialized dynamically by the main module. This would be achieved by having
+the shared modules import a `(global mut i32)` for each function they want
+to import from the main module, with the `i32` being the index of the global
+export in the `funcptr_table`.
+
+However, the converse instantiation scheme is also expressible, wherein the main
+module is instantiated first, so that its exports can be imported by shared
+modules. And other hybrids too, e.g., fusing `libc.wasm` with the main module,
+and instantiating this fused main+`libc` first, imported by the shared modules.
+
+Ultimately, the toolchain ABI will determine many of the details above; wasm
+linking just provides the necessary building blocks to allow the ABI to be
+expressed in pure WebAssembly in a declarative-enough form to be optimized,
+as mentioned below.
+
+**Link-time virtualization**
+
 TODO
-
-**"Command" modules**: easy
-* code example
-
-**"Shared-everything" (dynamic) linking**: so possible!
-* code example
-
-**Link-time virtualization**: also possible!
 * module imports: do not grant capabilities
-* static import parameters: capabilities only granted directly to root module
-* revisit virtualization example, now with code
+* constructor parameters: instances convey capabilities; must be explicitly
+  passed by the parent
+* revisit attenuation virtualization example, now with code
+
+## Additional use cases unlocked
+
+* Exports visible during start function
+* The daemonize pattern and self-revocation of capabilities
 
 
 ## Non-GC / AOT Embeddings
 
-TODO: may still require GC when static functions return references and static functions
-are called dynamically, but we can define a static criteria for when linking doesn't
-require GC and can be AOT-compiled.
+TODO:
+* describe the conditions for there to be no GC required.
+* describe what sort of AOT optimizations are possible.
 
 
 ## ESM-integration
 
-TODO: wasm linking could, in fact, be integrated
+TODO: wasm linking could, in fact, be integrated into ESM
 
 
 
@@ -575,3 +627,7 @@ TODO: wasm linking could, in fact, be integrated
 [Statically-linked]: https://en.wikipedia.org/wiki/Static_library
 [Dynamic linking]: https://en.wikipedia.org/wiki/Dynamic_loading
 [Principle of Least Authority]: https://en.wikipedia.org/wiki/Principle_of_least_privilege
+[ABI]: https://en.wikipedia.org/wiki/Application_binary_interface
+
+[`dllexport`]: https://docs.microsoft.com/en-us/cpp/cpp/dllexport-dllimport
+[`visibility("default")`]: https://gcc.gnu.org/wiki/Visibility
