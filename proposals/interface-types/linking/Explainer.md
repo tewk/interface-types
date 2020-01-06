@@ -29,11 +29,10 @@ underlying Interface Types proposal.
     2. [Dynamic shared-everything linking revisited](#dynamic-shared-everything-linking-revisited)
     3. [Link-time virtualization revisited](#link-time-virtualization-revisited)
 5. [Second-class modules](#second-class-modules)
-    1. [Problems with first-class modules](#problems-with-first-class-modules)
-    2. [Lifting first-class modules into the Interface Types](#lifting-first-class-modules-into-interface-types)
+    1. [Lifting first-class modules into the Interface Types](#lifting-first-class-modules-into-interface-types)
+    2. [Declarative linking via constructors](#declarative-linking-via-constructors)
     3. [Reframing the Interface Types proposal in terms of nested modules](#reframing-the-interface-types-proposal-in-terms-of-nested-modules)
-    4. [Declarative linking via constructors](#declarative-linking-via-constructors)
-    5. [Recovering the command module pattern](#recovering-the-command-module-pattern)
+    4. [Recovering the command module pattern](#recovering-the-command-module-pattern)
 6. [Use cases re-revisited](#use-cases-re-revisited)
     1. [Command modules re-revisited](#command-modules-re-revisited)
     2. [Dynamic shared-everything linking re-revisited](#dynamic-shared-everything-linking-re-revisited)
@@ -577,9 +576,8 @@ section, instance exports are necessarily re-exports of instance imports.
 ### Determinate module import linking
 
 Before we can see how first-class modules address the use cases, there is
-a problem to be solved that requires fundamentally extending the instantiation
-process. The problem is that, without any extension, module imports force
-all otherwise-private dependencies to be propagated to their clients.
+one more problem to be solved: module imports force all otherwise-private
+dependencies to be propagated to their clients.
 
 To see the problem, let's look at the dependency diagram from the
 [dynamic shared-everything linking use case](#dynamic-shared-everything-linking):
@@ -598,7 +596,7 @@ and how in more detail). This means that the module type of `zip.wasm` and
   ...
 )
 ```
-and the type of `viz.wasm` will start with:
+which means that the module type of `viz.wasm` will start with:
 ```wasm
 (module
   (import "zip.wasm" (module
@@ -614,77 +612,68 @@ and the type of `viz.wasm` will start with:
   ...
 )
 ```
-Now when `viz.wasm` calls `module.instantiate` to instantiate its imported
-`zip.wasm` and `img.wasm` it will need to get `libc.wasm` and `libm.wasm` from
+When `viz.wasm` calls `module.instantiate` to instantiate its imported
+`zip.wasm` and `img.wasm`, it will need to get `libc.wasm` and `libm.wasm` from
 *somewhere*. One option is to embed `libc.wasm` and `libm.wasm` into `viz.wasm`
-as nested modules, but now these shared libraries can't be shared with other
-modules in a system that includes `viz.wasm` (which in general, we shouldn't
-assume is the top-level module). Thus, `viz.wasm` should probably import
-`libc.wasm` and `libm.wasm` from "higher up". But now we have a design where
-the root module of a dependency tree ends up importing every single transitive
-dependency!
+as nested modules, but now these shared libraries can't be shared with the
+rest of the modules in the app. To share, `viz.wasm` needs to import `libc.wasm`
+and `libm.wasm` itself. But now we have a design where the root module of a
+dependency tree ends up importing every single transitive dependency!
 
-What we need to resolve this tension is a mechanism that has qualities of
-both module imports and nested modules: something that allows sharing but
-stays an encapsulated detail, not present in the module type.
-
-The solution is to split module imports into two formally-defined cases:
-* **determinate** module imports, which refer to a specific module and could
-  equivalently be transformed into a nested module; and
+To resolve this tension we need a mechanism that has qualities of both module
+imports and nested modules: something that allows sharing but stays an
+encapsulated detail, not present in the module type. The solution is to split
+module imports into two formally-defined cases:
+* **determinate** module imports, which refer to a specific module; and
 * **indeterminate** module imports, which behave as above: they are explicit
-  arguments supplied by the client.
+  arguments supplied by the client and only required to have a matching module
+  type.
 
-Effectively, thus far, *all* module imports have been indeterminate. To
-distinguish the two cases we observe that determinate module imports need *some*
-naming scheme to refer to a specific module, and so we can formally define this
-naming scheme as a string pattern, and say that any module import whose string
-matches the pattern is a determinate module import; all the rest are indeterminate.
+We can discriminate the two cases based on whether the import string is a
+[valid URL]; a URL specifies a particular module (via absolute or relative
+path) and is thus determinate. An import from any non-URL is indeterminate.
 
-The determinate import string *pattern* needs to be defined in a host-independent
-manner, even if the *resolution* is host-defined. One good candidate pattern
-would be the HTML-spec-defined [valid URL string], which will allow natural
-integration between Web and JS ecosystems.
-
-With this pattern defined, the wasm core spec's [module_instantiate] would change
-from having signature:
-* `module_instantiate(store, module, externval*) : (store, moduleinst | error)`
-to having signature:
+Next, the wasm spec's [`module_instantiate`] would be backwards-compatibly
+extended to:
 * `module_instantiate(store, module, externval*, modulemap?) : (store, moduleinst | error)`
-  * where `modulemap?` is an optional map from URLs to [module]s.
 
-The host/wasm contract is that, for the given `module` and every module in the
-`modulemap`:
-1. every module has been validated
-2. every definite import string is a key in `modulemap`
-3. there are no definite import cycles
-Given these preconditions, the first thing `module_instantiate` does is to
-perform a "link" step:
-* `link(module, modulemap?) : module`
-which replaces the definite imports of `module` with nested modules
-(recursively replacing the definite imports of the nested modules with
-further-nested modules). Assuming the above conditions, this step cannot fail
-and produces a new valid module with no definite imports.
+where `modulemap?` is an optional map from URLs to [module]s. As a precondition,
+the host must ensure that:
+1. there are no cycles in `modulemap` and
+2. all determinate import strings (URLs) in `module` and the module values of
+   `modulemap` are keys of `modulemap`.
 
-TODO: it'd be good to show an example
+If a `modulemap` is supplied, the first step of `module_instantiate` will be to
+perform a `module_link` transformation, which has the signature:
+* `module_link(module, modulemap) : module`
 
-TODO: mention capability safety
+where `module_link` recursively replaces determinate module imports with
+nested modules (using the `modulemap` to supply the replacement) until there are
+no more determinate module imports, starting with the root `module` argument.
+Before a module is substituted for a module import, it is checked to match the
+import's module type. Assuming none of these import type checks fail, the
+resulting module is guaranteed to be valid and will then be instantiated as
+normal.
 
-While the specification would perform naive substitution (replacing module imports
-with nested modules), a host implementation would be trivially enabled and
-expected to reuse module code. Alternative, `link` could be written to explicitly
-reuse nested modules by inserting nested modules at a higher point in the module
-tree and adding extra module reference operands to `module.instantiate` calls as
-necessary. The benefit of the latter approach is that it would prescribe exactly
-how toolchains like webpack could "pre-`link`" wasm modules at build time, as an
-optimization to reduce the number of files.
+Since `module_link` is always performed first, and since it removes all
+determinate imports before instantiation, determinate module imports effectively
+cease to be part of the module type. Thus, private dependencies can be kept
+encapsulated by importing from URLs.
 
-The `link` step effectively changes the module types of its operands, removing
-their determinate module imports. Because the `link` step is *always* performed,
-it is therefore valid to simply exclude determinate imports from module types.
-Thus, continuing with the above example, if `zip.wasm` and `img.wasm` use
-determinate imports such as `./libc.wasm` and `./libm.wasm`, then these
-dependencies are successfully kept out of their public interface and `viz.wasm`
-does not have to know they even exist.
+During `module_link`, a host implementation would be expected to reuse module
+code whenever a particular URL was used more than once. It would also be
+possible to specify an equivalent version of `module_link` that explicitly
+avoids duplication in the new module by hoisting nested modules to a common
+ancestor in the dependency DAG. This equivalent transformation could be applied
+by bundling tools (such as webpack) to reduce the number of modules or to
+collapse an entire application down to a single `.wasm` file.
+
+Finally, to be clear, the resolution of URLs to modules is still host-defined;
+the wasm spec is only extended to specify what happens *after* resolution is
+complete for an entire dependency DAG. However, with this addition, it's
+possible for a toolchain to start making some generally-portable assumptions
+about how URLs (particularly relative URLs) work&mdash;enough to start talking
+about addressing our use cases.
 
 
 ## Use cases revisited
@@ -705,13 +694,7 @@ TODO
 
 ## Second-class modules
 
-TODO
-
-... because the static use-def property
-
-### Problems with first-class modules
-
-TODO: rewrite
+Unfortunately, linking is not fully solved by first-class modules.
 
 One problem with a first-class instantiation API is that it fundamentally
 depends on GC. The reason is that, by containing mutable reference cells
@@ -722,25 +705,61 @@ rule, WebAssembly standardization avoids creating any hard dependencies on GC
 degree of embeddability of wasm, allowing GC support to be optional on hosts
 that need a small footprint.
 
-Another goal, specific to linking, is that linking should be declarative enough
-to allow:
-* webpack-style fusion of multiple linked wasm modules into a single wasm
-  module (using [multi-memory], to keep the source modules' memories
-  independent);
-* full Ahead-of-Time compilation of a linked module graph into a
-  native binary, optimizing aggressively based on whole-program knowledge.
+Even if a host does include GC, another problem is that the fundamental dynamism
+of first-class modules inhibits some predictable performance optimizations that
+we'd like. In particular, it should be possible to:
+* Ahead-of-Time compile a load-time-linked DAG of modules into a native binary
+  with static memory allocations for instances (as is possible and practiced
+  today for MVP wasm).
+* Eagerly release memory for command instances immediately after the command
+  completes, similar to joining on an OS subprocess.
+
+Lastly, linking should not be mutually be mutually exclusive to the use of
+interface types. As a core wasm feature, first-class modules provide no way
+to express interface types nor allow the instantiation-time adapter function
+fusion necessary to properly optimize interface types.
+
+TODO: segue into...
 
 ### Lifting first-class modules into the adapter layer
-
-TODO
-
-### Reframing the Interface Types proposal in terms of nested modules
 
 TODO
 
 ### Declarative linking via constructors
 
 TODO
+
+### Reframing the Interface Types proposal in terms of nested modules
+
+TODO: what if an adapted module in the current proposal:
+```wasm
+(module
+  (@interface func $a (import ...) ...)
+  (func $b (import ...) ...)
+  (func $c (export ...) ...)
+  (@interface func $d (export ...) ...)
+)
+```
+could be considered sugar for the composition of 3 nested modules:
+```wasm
+(@interface module
+  (@interface $import-adapter module
+    (func $a (import ...) ...)
+  )
+  (module $core-module
+    (func $b (import ...) ...)
+    (func $c (export ...) ...)
+  )
+  (@interface $export-adapter module 
+    (func $d (export ...) ...)
+  )
+  (ctor
+    module.instantiate $import-adapter
+    module.instantiate $core-module
+    module.instantiate $export-adapter
+  )
+)
+```
 
 ### Recovering the command module pattern
 
@@ -770,7 +789,7 @@ TODO
 [Default Export]: https://developer.mozilla.org/en-US/docs/web/javascript/reference/statements/export#Description
 [ESM-integration]: https://github.com/WebAssembly/esm-integration
 [HTML module loader]: https://html.spec.whatwg.org/#integration-with-the-javascript-module-system
-[Valid URL String]: https://url.spec.whatwg.org/#valid-url-string
+[Valid URL]: https://url.spec.whatwg.org/#valid-url-string
 [Import Object]: https://webassembly.github.io/spec/js-api/index.html#read-the-imports
 [Namespace Object]: https://tc39.es/ecma262/#sec-module-namespace-objects
 
