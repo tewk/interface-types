@@ -22,7 +22,8 @@ underlying Interface Types proposal.
     3. [Module and instance imports](#module-and-instance-imports)
     4. [Module and instance references and instructions](#module-and-instnace-references-and-instructions)
     5. [Nested modules](#nested-modules)
-    6. [Determinate module import linking](#determinate-module-import-linking)
+    6. [Module and instance exports](#module-and-instance-exports)
+    7. [Determinate module import linking](#determinate-module-import-linking)
 4. [Use cases revisited](#use-cases-revisited)
     1. [Command modules revisited](#command-modules-revisited)
     2. [Dynamic shared-everything linking revisited](#dynamic-shared-everything-linking-revisited)
@@ -144,7 +145,7 @@ be affected. Thus, `zip` and `img` need to be able to *privately* control how to
 instantiate and link their dependencies to achieve the instance graph on the
 right side of this diagram:
 
-<p align="center"><img src="./shared-everything.svg" width="750"></p>
+<p align="center"><img src="./shared-everything.svg" width="650"></p>
 
 The orange rectangles on the right show the (dynamic) component instances
 that are created at runtime from the orange (static) components on the left.
@@ -490,14 +491,14 @@ imported functions:
   )
 )
 ```
-Here the module `$m` imports an individual function, but whole imports can be
+Here the module `$m` imports an individual function, but whole instances can be
 imported just as well:
 ```wasm
 (module
   (type $I (instance
-    ... many exports
+    ... exports
   ))
-  (import "i" (instance $i (type $I)))
+  (import "x" (instance $x (type $I)))
   (import "m" (module $m
     (import "i" (instance (type $I)))
     (export "run" (func $run))
@@ -506,23 +507,20 @@ imported just as well:
     (call_ref
       (instance.export $run
         (module.instantiate $m
-          ref.instance $i)))
+          ref.instance $x)))
   )
 )
 ```
 Here, the `(type $I)` in the `import` statements is a [type use], allowing us to
-reuse the definition of `$I` instead of re-typing it each time. We can also see
-the convenience of passing whole instances, instead of the many export fields
-individually.
+reuse the type definition of `$I`.
 
 
 ### Nested modules
 
-The last essential piece of first-class modules is *nested modules*. A nested
-module is simply a module written inside another module. Just as function imports
-and definitions form a single function index space, module imports and nested
-modules form a single module index space, so they can be uniformly instantiated
-via `module.instantiate`. For example:
+A nested module is simply a module written inside another module. Just as
+function imports and definitions form a single function index space, module
+imports and nested modules form a single module index space, so they can be
+uniformly instantiated via `module.instantiate`. For example:
 ```wasm
 (module
   (module $child
@@ -537,29 +535,31 @@ via `module.instantiate`. For example:
 ```
 
 Unlike most source-language nested functions/classes, nested modules have no
-special access to their containing modules. Thus a nested module can be
-parsed/decoded and validated independently of its parent, without any shared
-environment. In the binary encoding, a nested module would be a sequence of
-bytes inside a section of the parent module which contained a complete, 
-standalone binary-format module.
+special access to their containing parent modules and thus can be parsed,
+decoded and validated independently; nesting only provides encapsulation. In
+the binary encoding, a nested module would be a sequence of bytes inside a
+section of the parent module which can be decoded according to the normal
+module decoding rules.
 
-In fact, it is 100% equivalent, to replace a module import, that is known to
-resolve a module `X`, with `X` as a nested module, without changing either the
+Thus, it is 100% equivalent to transform a module import that is known to
+resolve to a module `X` into a nested module `X` without changing either the
 text or binary format of `X`. The reverse direction is also 100% equivalent.
 This is an important and unique property of module imports / nested modules
 owing to the fact that a wasm module is a stateless function defined entirely
-in terms of its binary/text format. For example, a function import that resolves
-to a function exported by another module cannot be textually replaced since
-function imports inherently close over their enclosing (stateful) instance.
+in terms of its binary/text format.
 
 Is there also a symmetric concept of "nested instance"? In theory, this could
-be accomplished by giving `instance` statements a [constant initializer expression]
-that contained a restricted form of `module.instantiate`. However, this would
-be complex to define and fairly limited in practice compared to the second-class
-modules introduced later, so no nested instance concept is proposed.
+be accomplished by allowing `(instance expr)` statements, where `expr` was a
+[constant initializer expression] containing `module.instantiate`. However,
+this would be complex to define and fairly limited in practice compared to the
+second-class modules introduced later, so no nested instance concept is
+proposed here.
 
-To finish the first-class module feature, all modules and instances in the
-module/instance index space can be (re)exported, symmetric to all other things:
+
+### Module and instance exports
+
+To close out the first-class module feature, all modules and instances in the
+module/instance index space can be (re)exported, just like everything else:
 ```wasm
 (module
   (module $m1 ...)
@@ -570,24 +570,27 @@ module/instance index space can be (re)exported, symmetric to all other things:
   (export "3" (instance $i))
 )
 ```
-Because of the abovementioned lack of "nested instances", instance exports are
-necessarily re-exports of instance imports.
+Because of the lack of "nested instances", as described in the previous
+section, instance exports are necessarily re-exports of instance imports.
 
 
 ### Determinate module import linking
 
 Before we can see how first-class modules address the use cases, there is
-a problem to be solved that requires an addition to first-class modules.
-The problem is that plain module imports are not well-suited to representing
-dependencies that should be encapsulated implementation details.
+a problem to be solved that requires fundamentally extending the instantiation
+process. The problem is that, without any extension, module imports force
+all otherwise-private dependencies to be propagated to their clients.
 
-To see the problem, consider the dependency diagram shown in the above
-[dynamic shared-everything linking use case](#dynamic-shared-everything-linking).
+To see the problem, let's look at the dependency diagram from the
+[dynamic shared-everything linking use case](#dynamic-shared-everything-linking):
+
+<p align="center"><img src="./shared-everything.svg" width="650"></p>
+
 Let's assume for the moment that each of the arrows between `.wasm` modules
-(which represent dependencies) turn into module imports in parent modules
-(the [next section](#dynamic-shared-everything-linking-revisited) will describe
-why and how in more detail). Thus, the module type of `zip.wasm` and `img.wasm`
-look like:
+(which represent dependencies) are module imports in the client module (the
+[next section](#dynamic-shared-everything-linking-revisited) will describe why
+and how in more detail). This means that the module type of `zip.wasm` and
+`img.wasm` will start with:
 ```wasm
 (module
   (import "libc.wasm" (module ...))
@@ -595,7 +598,7 @@ look like:
   ...
 )
 ```
-and these imports will propagate into the type of `viz.wasm`:
+and the type of `viz.wasm` will start with:
 ```wasm
 (module
   (import "zip.wasm" (module
@@ -611,24 +614,25 @@ and these imports will propagate into the type of `viz.wasm`:
   ...
 )
 ```
-Now let's also assume that `viz.wasm` uses `module.instantiate` to instantiate
-its imported `zip.wasm` and `img.wasm`: it will need to get `libc.wasm` and
-`libm.wasm` from *somewhere*. One option is to embed `libc.wasm` and `libm.wasm`
-as nested modules, but now they can't be shared with other modules in a system
-that includes `viz.wasm`, defeating the point of dynamic linking. Thus, `viz.wasm`
-should probably import `libc.wasm` and `libm.wasm`. But extrapolating out to a
-big dependency tree, we can see that this doesn't scale: the root module ends
-up importing every transitive dependency!
+Now when `viz.wasm` calls `module.instantiate` to instantiate its imported
+`zip.wasm` and `img.wasm` it will need to get `libc.wasm` and `libm.wasm` from
+*somewhere*. One option is to embed `libc.wasm` and `libm.wasm` into `viz.wasm`
+as nested modules, but now these shared libraries can't be shared with other
+modules in a system that includes `viz.wasm` (which in general, we shouldn't
+assume is the top-level module). Thus, `viz.wasm` should probably import
+`libc.wasm` and `libm.wasm` from "higher up". But now we have a design where
+the root module of a dependency tree ends up importing every single transitive
+dependency!
 
-What we'd like is a mechanism that acts like both a module import and a nested
-module: like a module import, it allowed sharing, but like a nested module, it
-didn't show up in the module type; it was a private encapsulated detail.
+What we need to resolve this tension is a mechanism that has qualities of
+both module imports and nested modules: something that allows sharing but
+stays an encapsulated detail, not present in the module type.
 
 The solution is to split module imports into two formally-defined cases:
 * **determinate** module imports, which refer to a specific module and could
-  equivalently be transformed into a nested module;
-* **indeterminate** module imports, which behave as above: they are arguments
-  supplied by the host or a parent module.
+  equivalently be transformed into a nested module; and
+* **indeterminate** module imports, which behave as above: they are explicit
+  arguments supplied by the client.
 
 Effectively, thus far, *all* module imports have been indeterminate. To
 distinguish the two cases we observe that determinate module imports need *some*
@@ -662,6 +666,8 @@ further-nested modules). Assuming the above conditions, this step cannot fail
 and produces a new valid module with no definite imports.
 
 TODO: it'd be good to show an example
+
+TODO: mention capability safety
 
 While the specification would perform naive substitution (replacing module imports
 with nested modules), a host implementation would be trivially enabled and
@@ -705,7 +711,7 @@ TODO
 
 ### Problems with first-class modules
 
-TODO
+TODO: rewrite
 
 One problem with a first-class instantiation API is that it fundamentally
 depends on GC. The reason is that, by containing mutable reference cells
@@ -726,24 +732,23 @@ to allow:
 
 ### Lifting first-class modules into the adapter layer
 
-... is easy
+TODO
 
 ### Reframing the Interface Types proposal in terms of nested modules
 
-... is simpler and more general
+TODO
 
 ### Declarative linking via constructors
 
-... is more efficient
+TODO
 
 ### Recovering the command module pattern
 
-... is more expressive while still efficient
-
+TODO
 
 ## Use cases re-revisited
 
-... still addressed!
+TODO
 
 
 
