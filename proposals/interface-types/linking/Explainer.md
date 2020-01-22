@@ -23,7 +23,7 @@ underlying Interface Types proposal.
     4. [Module and instance references and instructions](#module-and-instnace-references-and-instructions)
     5. [Nested modules](#nested-modules)
     6. [Module and instance exports](#module-and-instance-exports)
-    7. [Determinate module import linking](#determinate-module-import-linking)
+3. [Determinate module import linking](#determinate-module-import-linking)
 4. [Use cases revisited](#use-cases-revisited)
     1. [Command modules revisited](#command-modules-revisited)
     2. [Dynamic shared-everything linking revisited](#dynamic-shared-everything-linking-revisited)
@@ -112,22 +112,21 @@ eagerly or at most once for a given module.*
 
 The principle behind the [shared-nothing] model is that, since it's difficult
 and error prone to get unrelated toolchains and languages to share low-level
-state, like linear memory and tables, such low-level state should be
-encapsulated by a module by default. However, many C/C++/Rust libraries
-cannot be factored to share nothing, either due to fundamental dependencies on
-sharing memory in the interface or practical reasons like performance
-or difficulty refactoring. By default, such libraries are currently
-[statically linked] into a containing wasm module. However, statically
-linking *everything* leads to code duplication which is classically
-addressed in native code by [dynamic linking]. In the context of wasm, we'll
-call this "dynamic *shared-everything* linking" to distinguish it from dynamic
-*shared-nothing* linking, both of which are possible in wasm.
+state, like linear memory and tables, this state should be encapsulated by a
+module by default. However, many C/C++/Rust libraries cannot be factored to
+share nothing, either due to fundamental dependencies on sharing memory in the
+interface or practical reasons like performance or difficulty refactoring. By
+default, such libraries are currently [statically linked] into a containing wasm
+module. Statically linking everything leads to code duplication which is
+classically addressed in native code environments by [dynamic linking]. In the
+context of wasm, we'll call this "dynamic *shared-everything* linking" to
+distinguish it from dynamic *shared-nothing* linking.
 
 A challenge with dynamic shared-everything linking is to control which
 instances share which memory. In particular, it should be possible to write a
 "main" module (the analogue of a native executable) that creates its own private
 memory, explicitly shares it with N other "shared" modules (the analogue of
-native `.dll`/`.so`s), but encapsulates its memory from all *other* modules, so
+native `.dll`/`.so`s), but encapsulates its memory from *all other* modules so
 that the use of shared-everything linking is kept an implementation detail from
 the point of view of the main module's clients. Thus, we want a two-level
 hierarchy, where multiple same-language/ABI wasm modules are composed into a
@@ -140,9 +139,10 @@ on two components `zip` and `img` which happen to share library code (`libc` and
 `libm`). `viz` shouldn't need to know the implementation language of `zip` and
 `img`, much less that they share library code; in the future, if `zip` uses
 different libraries or a different version of the same library, `viz` shouldn't
-be affected. Thus, `zip` and `img` need to be able to *privately* control how to
-instantiate and link their dependencies to achieve the instance graph on the
-right side of this diagram:
+have to know or care. This high-level requirement boils down to a low-level
+requirement that each component should get a *new* instance of each shared
+library in the component. Thus, the static dependency graph shown on the left
+should produce the dynamic instance graph shown on the right:
 
 <p align="center"><img src="./shared-everything.svg" width="650"></p>
 
@@ -159,7 +159,7 @@ languages like C/C++ and Rust, there will still be a need for shared-everything
 linking with GC languages even after the [GC proposal]. Instead of sharing linear
 memory, GC languages will need to share metadata, vtables, runtime type tags,
 runtime support machinery, etc. Thus, the two-level module/component hierarchy
-is essential to the wasm ecosystem.
+is essential to the whole wasm ecosystem, now and in the future.
 
 *This use case rules out any linking solution where main modules are not able
 to explicitly create and link together private instances of a language runtime
@@ -175,7 +175,7 @@ linking proposal should preserve:
 First, it supports applications that wish to adhere to the 
 [Principle of Least Authority], passing modules only the imports necessary to do
 their job. Some Web applications are already relying on this property to
-sandbox untrusted plugins.
+sandbox untrusted wasm plugins.
 
 Second, it enables client modules to fully or partially [virtualize] the imports
 of their dependencies without extraordinary challenge or performance overhead.
@@ -193,18 +193,18 @@ While it is possible to perform virtualization at run-time, e.g., passing
 function references for all virtualizable operations, this approach would be
 problematic as a basis for a highly-virtualizable ecosystem since it would
 require modules to intentionally opt into virtualization by choosing to receive
-first-class function references instead of using imports. In the limit, to
-provide maximum flexibility to client code, toolchains should avoid *all* use
-of imports, effectively annulling a core part of wasm. Because of their
-more-static nature, imports are inherently more efficient and optimizable than
-first-class function references, so this would also have a negative performance
-impact.
+first-class function references instead of using function imports. In the limit,
+to provide maximum flexibility to client code, toolchains would need to avoid
+*all* use of imports, effectively annulling a core part of wasm. Because of
+their more-static nature, imports are inherently more efficient and optimizable
+than first-class function references, so this would also have a negative
+performance impact.
 
 To avoid the problems of run-time virtualization, wasm linking should therefore
-enable **link-time virtualization**, such that a parent module can control
-*all* the imports of its dependencies (without any explicit opt-in by the
-dependency), just as with the JS API. As an example, it should be possible to
-use wasm linking to achieve the following instance graph:
+enable **link-time virtualization**, such that a parent module can specify
+all the imports of its dependencies (without any explicit opt-in on the part
+of those dependencies), just as with the JS API. As an example, it should be
+possible to use wasm linking to achieve the following instance graph:
 
 <p align="center"><img src="./virtualization.svg" width="400"></p>
 
@@ -213,9 +213,9 @@ Here, despite the fact that `parent.wasm` and `child.wasm` both import the same
 which it passes to the child. Thus, `wasi:file` doesn't identify a single
 global implementation; rather it names an *interface* which can be variously
 implemented. Indeed, even `parent.wasm` doesn't know whether it received the
-"system" implementation of `wasi:file` or some other implementation supplied by
-another module that imports `parent.wasm` (hence the `? instance` in the
-diagram). There may not even *be* a "system" implementation of `wasi:file`.
+host's native implementation of `wasi:file` or some other implementation
+supplied by another module that imports `parent.wasm` (hence the `? instance` in
+the diagram). There may not even *be* a "native" implementation of `wasi:file`.
 Crtically, though, there is no way for `child.wasm` to bypass `parent.wasm` in
 its request for `wasi:file`.
 
@@ -440,18 +440,18 @@ are two new instructions for creating first-class module and instance references
 Second, given an instance reference, `instance.export` extracts a first-class
 reference to one of its fields, identified statically by an index into the
 ordered list of exports declared by the instance type:
-* `instance.export $export : [(ref (instance $I))] -> [(ref $T)]`
-  * iff the `$export`'th export of `$I` has type `$T`
+* `instance.export <export-string> : [(ref (instance $I))] -> [(ref $T)]`
+  * iff `$I` has an export named `<export-string>` with type `$T`
 
 For example, we can now fill in the body of the above `$callRun` function:
 ```wasm
 (module
   (type $I (instance
-    (export "run" (func $run (param i32) (result i32)))
+    (export "run" (func (param i32) (result i32)))
   ))
   (func $callRun (param $i (ref $I)) (result i32)
     local.get $i
-    instance.export $run
+    instance.export "run"
     i32.const 42
     call_ref
   )
@@ -474,17 +474,17 @@ imported functions:
 (module
   (import "m" (module $m
     (import "i" (func))
-    (export "run" (func $run))
+    (export "run" (func))
   ))
   (func $f1 ...)
   (func $f2 ...)
   (func $runWithBoth
     (call_ref
-      (instance.export $run
+      (instance.export "run"
         (module.instantiate $m
           (ref.func $f1))))
     (call_ref
-      (instance.export $run
+      (instance.export "run"
         (module.instantiate $m
           (ref.func $f2))))
   )
@@ -500,11 +500,11 @@ imported just as well:
   (import "x" (instance $x (type $I)))
   (import "m" (module $m
     (import "i" (instance (type $I)))
-    (export "run" (func $run))
+    (export "run" (func))
   ))
   (func $runWithImport
     (call_ref
-      (instance.export $run
+      (instance.export "run"
         (module.instantiate $m
           ref.instance $x)))
   )
@@ -573,22 +573,22 @@ Because of the lack of "nested instances", as described in the previous
 section, instance exports are necessarily re-exports of instance imports.
 
 
-### Determinate module import linking
+## Determinate module import linking
 
 Before we can see how first-class modules address the use cases, there is
-one more problem to be solved: module imports force all otherwise-private
-dependencies to be propagated to their clients.
+one more problem to be solved: module imports force all private dependencies of
+a module to be exposed in its public API to be explicitly by its clients.
 
 To see the problem, let's look at the dependency diagram from the
 [dynamic shared-everything linking use case](#dynamic-shared-everything-linking):
 
 <p align="center"><img src="./shared-everything.svg" width="650"></p>
 
-Let's assume for the moment that each of the arrows between `.wasm` modules
-(which represent dependencies) are module imports in the client module (the
+Let's assume for the moment that each of the dependency arrows between `.wasm`
+modules become module imports in the client module (the
 [next section](#dynamic-shared-everything-linking-revisited) will describe why
-and how in more detail). This means that the module type of `zip.wasm` and
-`img.wasm` will start with:
+and how in more detail). This means that, e.g., the module type of `zip.wasm`
+and `img.wasm` will be:
 ```wasm
 (module
   (import "libc.wasm" (module ...))
@@ -596,7 +596,7 @@ and how in more detail). This means that the module type of `zip.wasm` and
   ...
 )
 ```
-which means that the module type of `viz.wasm` will start with:
+which means that the module type of `viz.wasm` will be:
 ```wasm
 (module
   (import "zip.wasm" (module
@@ -613,64 +613,74 @@ which means that the module type of `viz.wasm` will start with:
 )
 ```
 When `viz.wasm` calls `module.instantiate` to instantiate its imported
-`zip.wasm` and `img.wasm`, it will need to get `libc.wasm` and `libm.wasm` from
-*somewhere*. One option is to embed `libc.wasm` and `libm.wasm` into `viz.wasm`
-as nested modules, but now these shared libraries can't be shared with the
-rest of the modules in the app. To share, `viz.wasm` needs to import `libc.wasm`
-and `libm.wasm` itself. But now we have a design where the root module of a
-dependency tree ends up importing every single transitive dependency!
+`zip.wasm` and `img.wasm` modules, `viz.wasm` will need to get `libc.wasm` and
+`libm.wasm` from *somewhere*. One option is to embed `libc.wasm` and `libm.wasm`
+into `viz.wasm` as nested modules, but now these shared libraries can't be
+shared with the broader app, which may contain other uses of these same shared
+libraries. To enable maximal sharing, `viz.wasm` needs to import `libc.wasm` and
+`libm.wasm` *itself*. But now we have a design where ultimately the root module
+of a module graph ends up importing *every single* transitive dependency!
 
 To resolve this tension we need a mechanism that has qualities of both module
-imports and nested modules: something that allows sharing but stays an
-encapsulated detail, not present in the module type. The solution is to split
-module imports into two formally-defined cases:
+imports and nested modules: something that allows sharing of dependencies but
+still keeps dependencies an encapsulated detail, not present in the module type.
+
+The solution proposed here is to introduce a new **determinate module import linking**
+phase in the WebAssembly specification.
+
+The first step is to split module imports into two formally-defined cases:
 * **determinate** module imports, which refer to a specific module; and
 * **indeterminate** module imports, which behave as above: they are explicit
-  arguments supplied by the client and only required to have a matching module
-  type.
+  arguments supplied by the client and only required to have a matching
+  module type.
 
-We can discriminate the two cases based on whether the import string is a
-[valid URL]; a URL specifies a particular module (via absolute or relative
-path) and is thus determinate. An import from any non-URL is indeterminate.
+To formally discriminate these two cases, we specify that any *single-level*
+import whose string is a [valid URL] is a determinate import and all other
+imports are indeterminate. Single single-level imports are new, this definition
+ensures that no existing wasm module contains determinate imports, which is
+necessary to ensure that the following steps are backwards compatible.
 
-Next, the wasm spec's [`module_instantiate`] would be backwards-compatibly
-extended to:
+Next, the wasm spec's existing [`module_instantiate`] entry point is extended to
+have an optional `modulemap` argument:
 * `module_instantiate(store, module, externval*, modulemap?) : (store, moduleinst | error)`
 
-where `modulemap?` is an optional map from URLs to [module]s. As a precondition,
-the host must ensure that:
+where `modulemap` is a map from URLs to [module]s. As a precondition, the host
+must ensure that:
 1. there are no cycles in `modulemap` and
 2. all determinate import strings (URLs) in `module` and the module values of
-   `modulemap` are keys of `modulemap`.
+   `modulemap` are present as keys of `modulemap`.
 
-If a `modulemap` is supplied, the first step of `module_instantiate` will be to
-perform a `module_link` transformation, which has the signature:
-* `module_link(module, modulemap) : module`
+A new "determinate module linking" phase is then added to the beginning of
+`module_instantiate` that transforms the incoming `module` as defined by a
+new `module_link` function with signature:
+* `module_link(module, modulemap) : (module | error)`
 
-where `module_link` recursively replaces determinate module imports with
-nested modules (using the `modulemap` to supply the replacement) until there are
-no more determinate module imports, starting with the root `module` argument.
-Before a module is substituted for a module import, it is checked to match the
-import's module type. Assuming none of these import type checks fail, the
-resulting module is guaranteed to be valid and will then be instantiated as
-normal.
+The `module_link` function recursively replaces determinate module imports in
+`module` with nested modules according to `modulemap` until there are no more
+determinate module imports. Before each substitution, the new nested module is
+checked to match the module import's declared type, ensuring that if
+`module_link` does not fail, the resulting module is valid.
 
-Since `module_link` is always performed first, and since it removes all
+Since `module_link` is always performed first and since it removes all
 determinate imports before instantiation, determinate module imports effectively
-cease to be part of the module type. Thus, private dependencies can be kept
-encapsulated by importing from URLs.
+cease to be part of the module type from the perspective of the 
+`module.instantiate` instruction. Thus, determinate module imports are never
+present in module type thereby achieving the goal of encapsulating private
+dependencies.
 
-During `module_link`, a host implementation would be expected to reuse module
-code whenever a particular URL was used more than once. It would also be
-possible to specify an equivalent version of `module_link` that explicitly
-avoids duplication in the new module by hoisting nested modules to a common
-ancestor in the dependency DAG. This equivalent transformation could be applied
-by bundling tools (such as webpack) to reduce the number of modules or to
-collapse an entire application down to a single `.wasm` file.
+During `module_link`, a host implementation is expected to reuse module code
+whenever a particular URL is used more than once instead of blindly substituting
+copies. However, it would also be possible, although more complex, to specify an
+observably-equivalent version of `module_link` that explicitly avoids
+duplication in the new module by hoisting nested modules to a common ancestor in
+the dependency DAG. This "optimizing" transformation could then be literally
+implemented by bundling/deployment tools (such as webpack) as an optimization,
+allowing N pre-bundle modules collapsed down to 1 by optimizing tools (such as
+webpack).
 
 Finally, to be clear, the resolution of URLs to modules is still host-defined;
 the wasm spec is only extended to specify what happens *after* resolution is
-complete for an entire dependency DAG. However, with this addition, it's
+complete for an *entire* module graph. However, with this addition, it's
 possible for a toolchain to start making some generally-portable assumptions
 about how URLs (particularly relative URLs) work&mdash;enough to start talking
 about addressing our use cases.
@@ -678,19 +688,142 @@ about addressing our use cases.
 
 ## Use cases revisited
 
-TODO
+With first-class modules and determinate module import linking, we can now
+revisit the motivating use cases identified above and see how they are
+addressed.
+
 
 ### Command modules revisited
 
-TODO
+TODO: words
+
+```wasm
+(module
+  (type $WasiFileInstance (instance
+    ...
+  ))
+  (import "wasi:file" (type $WasiFileInstance))
+  (module $main
+    (import "wasi:file" (type $WasiFileInstance))
+    (func (export "main") (param i32) (result i32)
+      ...
+    )
+  )
+  (func (export "run") (param i32) (result i32)
+    (call_ref
+      (instance.export "main"
+        (module.instantiate
+          (instance.get $i)))
+      (local.get 0))
+  )
+)
+```
 
 ### Dynamic shared-everything linking revisited
 
-TODO
+TODO: words
+
+```wasm
+// libc.wasm
+(module
+  (memory (export "memory"))
+  (func (export "malloc") (param i32) (result i32) ...)
+)
+```
+
+```wasm
+// libm.wasm
+(module
+  (type $LibcInstance (instance
+    (memory (export "memory"))
+    (func (export "malloc") (param i32) (result i32))
+  ))
+  (import "libc" (type $LibcInstance))
+
+  (func (export "sin") (param f64) (result f64) ...)
+)
+```
+
+* note instance import
+
+```wasm
+// zip.wasm
+(module
+  (type $LibcInstance (instance
+    (memory (export "memory"))
+    (func (export "malloc") (param i32) (result i32))
+  ))
+  (import "./libc" (module $Libc
+    (exports $LibcInstance)
+  ))
+
+  (type $LibmInstance (instance
+    (func (export "sin") (param f64) (result f64))
+  ))
+  (import "./libm.wasm" (module $libm
+    (import "libc" (type $LibcInstance))
+    (exports $LibmInstance)
+  ))
+
+  (module $main
+    (import "libc" (type $LibcInstance))
+    (import "libm" (type $LibmInstance))
+    (func (export "run") (param i32 i32) (result i32 i32)
+      ...
+    )
+  )
+
+  (@interface func (export "zip") (param $in (array u8)) (result (array u8))
+    module.instantiate $Libc
+    (let (local $libc (ref $LibcInstance))
+      (module.instantiate $libm (local.get $libc))
+      (let (local $libm (ref $LibmInstance))
+        (module.instantiate $main (local.get $libc) (local.get $libm))
+        (return
+          (memory-to-array
+            (call_ref
+              (instance.export "run")
+              (array-to-memory (local.get $in))
+            )
+          )
+        )
+      )
+    )
+  )
+)
+```
+* note determinate *module* imports, not *instance*
+* `(exports $FooInstance)` is syntactic sugar
+
+```wasm
+// viz.wasm
+(module
+  (import "zip.wasm" (module
+    (func (export "run") (param (array u8)) (result (array u8)))
+  ))
+  (import "zip.wasm" (module
+    (func (export "run") (param (array u8)) (result (array u8)))
+  ))
+  ...
+)
+```
+* note no mention of libc/libm
+
 
 ### Link-time virtualization revisited
 
-TODO
+TODO: words
+
+```wasm
+(module
+  (type $
+)
+```
+
+
+
+* note why determinate module import linking isn't a violation
+
 
 ## Second-class modules
 
